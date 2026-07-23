@@ -216,8 +216,12 @@ def handle_fetch_url(args):
             return {"action": "block",
                     "reason": f"Host '{host}' resolves to a private/loopback/link-local/metadata address."}
 
+        # Gate on the public-IP check above, then let requests handle the
+        # actual connection normally (no IP pinning) — pinning was causing
+        # spurious failures when the pinned address family (v4/v6) didn't
+        # match what the network path actually supports.
         try:
-            resp = fetch_pinned(current_url, ips[0], FETCH_TIMEOUT)
+            resp = requests.get(current_url, timeout=FETCH_TIMEOUT, allow_redirects=False)
         except requests.exceptions.Timeout:
             return {"action": "block", "reason": "Upstream request timed out."}
         except Exception as e:
@@ -225,7 +229,6 @@ def handle_fetch_url(args):
 
         if resp.status_code in (301, 302, 303, 307, 308) and "Location" in resp.headers:
             next_url = urljoin(current_url, resp.headers["Location"])
-            # Re-validate scheme/host/port on the redirect target before following.
             if not parse_https_host(next_url):
                 return {"action": "block",
                         "reason": "Redirect target is not a valid public HTTPS URL."}
