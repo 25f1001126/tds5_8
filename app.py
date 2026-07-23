@@ -81,14 +81,12 @@ def handle_read_file(args):
     if "\x00" in path:
         return {"action": "block", "reason": "Null byte in path."}
 
-    # 1. Validate EVERY decoded/normalized variant BEFORE any filesystem access.
     for variant in decoded_variants(path):
         real = canonical_real(variant)
         if not is_safe_realpath(real):
             return {"action": "block",
                     "reason": "Path (literal, decoded, or symlink-resolved) escapes the sandbox."}
 
-    # 2. All variants check out — resolve literal path for actual access.
     literal_resolved = resolve_literal(path)
     real_final = canonical_real(path)
 
@@ -119,15 +117,17 @@ def handle_read_file(args):
 # fetch_url
 # ---------------------------------------------------------------------
 
-def parse_https_host(url: str):
-    """Return hostname only if the URL is well-formed HTTPS with no
-       userinfo and no non-standard port. Returns None otherwise."""
+def parse_host(url: str):
+    """Return hostname if the URL is well-formed http(s) with no userinfo
+       and only a default/no port. Returns None otherwise.
+       NOTE: both http and https are accepted per the actual task spec —
+       the policy restricts by HOST, not by scheme."""
     try:
         parts = urlsplit(url)
     except Exception:
         return None
 
-    if parts.scheme != "https":
+    if parts.scheme not in ("http", "https"):
         return None
     if parts.username is not None or parts.password is not None:
         return None
@@ -139,7 +139,8 @@ def parse_https_host(url: str):
         return None
 
     port = parts.port
-    if port is not None and port != 443:
+    default_port = 443 if parts.scheme == "https" else 80
+    if port is not None and port != default_port:
         return None
 
     return host
@@ -151,9 +152,9 @@ def host_allowed(host: str) -> bool:
 
 def is_public_ip(ip_str: str) -> bool:
     """Only exclude addresses that are genuinely non-public/internal.
-       Note: deliberately NOT using is_reserved — that flag covers many
-       IANA special-purpose blocks that are still publicly routable, and
-       incorrectly overblocks legitimate hosts like iana.org's own IPs."""
+       Deliberately NOT using is_reserved — it covers IANA special-purpose
+       blocks that are still publicly routable and would overblock
+       legitimate hosts."""
     try:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
@@ -189,10 +190,10 @@ def handle_fetch_url(args):
 
     current_url = url
     for _ in range(MAX_REDIRECTS + 1):
-        host = parse_https_host(current_url)
+        host = parse_host(current_url)
         if not host:
             return {"action": "block",
-                    "reason": "Only public HTTPS URLs to allowed hosts are accepted (no userinfo, no non-standard port)."}
+                    "reason": "URL is malformed or uses userinfo/non-default port."}
         if not host_allowed(host):
             return {"action": "block",
                     "reason": f"Host '{host}' is not on the allowed list (example.com, www.iana.org)."}
@@ -211,9 +212,9 @@ def handle_fetch_url(args):
 
         if resp.status_code in (301, 302, 303, 307, 308) and "Location" in resp.headers:
             next_url = urljoin(current_url, resp.headers["Location"])
-            if not parse_https_host(next_url):
+            if not parse_host(next_url):
                 return {"action": "block",
-                        "reason": "Redirect target is not a valid public HTTPS URL."}
+                        "reason": "Redirect target is malformed or uses userinfo/non-default port."}
             current_url = next_url
             continue
 
