@@ -81,7 +81,10 @@ def handle_read_file(args):
     if "\x00" in path:
         return {"action": "block", "reason": "Null byte in path."}
 
+    # Validate every decoded/normalized variant BEFORE any filesystem access.
     for variant in decoded_variants(path):
+        if "\x00" in variant:
+            return {"action": "block", "reason": "Null byte revealed after decoding."}
         real = canonical_real(variant)
         if not is_safe_realpath(real):
             return {"action": "block",
@@ -119,9 +122,8 @@ def handle_read_file(args):
 
 def parse_host(url: str):
     """Return hostname if the URL is well-formed http(s) with no userinfo
-       and only a default/no port. Returns None otherwise.
-       NOTE: both http and https are accepted per the actual task spec —
-       the policy restricts by HOST, not by scheme."""
+       and only a default/no port. Both http and https accepted — the
+       policy restricts by HOST, not by scheme."""
     try:
         parts = urlsplit(url)
     except Exception:
@@ -152,18 +154,34 @@ def host_allowed(host: str) -> bool:
 
 def is_public_ip(ip_str: str) -> bool:
     """Only exclude addresses that are genuinely non-public/internal.
-       Deliberately NOT using is_reserved — it covers IANA special-purpose
-       blocks that are still publicly routable and would overblock
-       legitimate hosts."""
+       Deliberately NOT using is_reserved (overblocks legitimate publicly
+       routable IANA special-purpose blocks). Explicitly unwraps
+       IPv4-mapped IPv6 addresses (e.g. ::ffff:127.0.0.1), since
+       ip.is_loopback/.is_private on the IPv6 form alone do NOT catch
+       the mapped IPv4 loopback/private range — a real bypass otherwise."""
     try:
         ip = ipaddress.ip_address(ip_str)
     except ValueError:
         return False
-    if (ip.is_private or ip.is_loopback or ip.is_link_local or
-            ip.is_multicast or ip.is_unspecified):
-        return False
-    if ip_str == "169.254.169.254":
-        return False
+
+    candidates = [ip]
+    if isinstance(ip, ipaddress.IPv6Address):
+        mapped = getattr(ip, "ipv4_mapped", None)
+        if mapped is not None:
+            candidates.append(mapped)
+        # Also catch IPv4-compatible (deprecated) and 6to4/Teredo tunneling
+        # of private ranges by checking sixtofour / teredo attributes.
+        sixtofour = getattr(ip, "sixtofour", None)
+        if sixtofour is not None:
+            candidates.append(sixtofour)
+
+    for cand in candidates:
+        if (cand.is_private or cand.is_loopback or cand.is_link_local or
+                cand.is_multicast or cand.is_unspecified):
+            return False
+        if str(cand) == "169.254.169.254":
+            return False
+
     return True
 
 
