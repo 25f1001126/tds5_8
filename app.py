@@ -51,10 +51,6 @@ def resolve_literal(path: str) -> str:
     return os.path.normpath(candidate)
 
 
-def within_sandbox(resolved: str) -> bool:
-    return resolved == SANDBOX_ROOT or resolved.startswith(SANDBOX_ROOT + os.sep)
-
-
 def decoded_variants(path: str):
     variants = {path}
     cur = path
@@ -71,34 +67,14 @@ def decoded_variants(path: str):
     return variants
 
 
-def any_variant_escapes(path: str) -> bool:
-    for v in decoded_variants(path):
-        resolved = resolve_literal(v)
-        if not within_sandbox(resolved):
-            return True
-    return False
+def canonical_real(path_str: str) -> str:
+    """Resolve to an absolute, symlink-free, normalized real path."""
+    return os.path.realpath(resolve_literal(path_str))
 
 
-def symlink_escapes(resolved: str) -> bool:
-    """True if the real (symlink-resolved) path leaves the sandbox.
-       Also True if any parent component up to the sandbox root is a
-       symlink pointing outside, even when the final path doesn't exist."""
+def is_safe_realpath(real: str) -> bool:
     sandbox_real = os.path.realpath(SANDBOX_ROOT)
-    real = os.path.realpath(resolved)
-    if not (real == sandbox_real or real.startswith(sandbox_real + os.sep)):
-        return True
-    # Walk existing parents to catch a symlinked directory even if the
-    # leaf file itself doesn't exist yet.
-    parent = os.path.dirname(resolved)
-    while parent and parent != os.path.dirname(parent):
-        if os.path.islink(parent):
-            real_parent = os.path.realpath(parent)
-            if not (real_parent == sandbox_real or real_parent.startswith(sandbox_real + os.sep)):
-                return True
-        if parent == SANDBOX_ROOT:
-            break
-        parent = os.path.dirname(parent)
-    return False
+    return real == sandbox_real or real.startswith(sandbox_real + os.sep)
 
 
 def handle_read_file(args):
@@ -108,53 +84,69 @@ def handle_read_file(args):
     if "\x00" in path:
         return {"action": "block", "reason": "Null byte in path."}
 
+    # 1. Validate EVERY decoded/normalized variant BEFORE any filesystem access.
+    #    Any variant whose realpath escapes the sandbox -> block immediately.
+    for variant in decoded_variants(path):
+        real = canonical_real(variant)
+        if not is_safe_realpath(real):
+            return {"action": "block",
+                    "reason": "Path (literal, decoded, or symlink-resolved) escapes the sandbox."}
+
+    # 2. All variants check out — resolve literal path for actual access.
     literal_resolved = resolve_literal(path)
+    real_final = canonical_real(path)
 
-    if within_sandbox(literal_resolved):
-        # Any symlink trickery anywhere on the path -> hard block, regardless
-        # of whether the target currently exists.
-        if symlink_escapes(literal_resolved):
-            return {"action": "block", "reason": "Path escapes the sandbox via a symlink."}
+    if not is_safe_realpath(real_final):
+        return {"action": "block", "reason": "Resolved path is outside the sandbox."}
 
-        exists_on_disk = os.path.isfile(literal_resolved)
-        exists_virtual = literal_resolved in VIRTUAL_FILES
+    exists_on_disk = os.path.isfile(literal_resolved)
+    exists_virtual = literal_resolved in VIRTUAL_FILES
 
-        if exists_on_disk or exists_virtual:
-            content = None
-            if exists_on_disk:
-                try:
-                    with open(literal_resolved, "r", errors="replace") as f:
-                        content = f.read(200_000)
-                except Exception:
-                    content = None
-            if content is None and exists_virtual:
-                content = VIRTUAL_FILES[literal_resolved]
-            return {"action": "allow", "reason": "Path resolves to a real file inside the sandbox.",
-                    "result": content or ""}
+    if exists_on_disk or exists_virtual:
+        content = None
+        if exists_on_disk:
+            try:
+                with open(literal_resolved, "r", errors="replace") as f:
+                    content = f.read(200_000)
+            except Exception:
+                content = None
+        if content is None and exists_virtual:
+            content = VIRTUAL_FILES[literal_resolved]
+        return {"action": "allow", "reason": "Path resolves to a real file inside the sandbox.",
+                "result": content or ""}
 
-    if any_variant_escapes(path):
-        return {"action": "block",
-                "reason": "Path (or a decoded/normalized form of it) resolves outside the sandbox."}
-
-    if within_sandbox(literal_resolved):
-        return {"action": "allow", "reason": "Path is within the sandbox.",
-                "result": {"content": "", "error": "file not found"}}
-
-    return {"action": "block", "reason": "Path resolves outside the permitted sandbox directory."}
+    return {"action": "allow", "reason": "Path is within the sandbox.",
+            "result": {"content": "", "error": "file not found"}}
 
 
 # ---------------------------------------------------------------------
 # fetch_url
 # ---------------------------------------------------------------------
 
-def hostname_of(url: str):
+def parse_https_host(url: str):
+    """Return hostname only if the URL is well-formed HTTPS with no
+       userinfo and no non-standard port. Returns None otherwise."""
     try:
         parts = urlsplit(url)
-        if parts.scheme not in ("http", "https"):
-            return None
-        return (parts.hostname or "").lower().rstrip(".") or None
     except Exception:
         return None
+
+    if parts.scheme != "https":
+        return None
+    if parts.username is not None or parts.password is not None:
+        return None
+    if "@" in (parts.netloc or ""):
+        return None  # belt-and-suspenders against userinfo-confusion tricks
+
+    host = (parts.hostname or "").lower().rstrip(".")
+    if not host:
+        return None
+
+    port = parts.port
+    if port is not None and port != 443:
+        return None
+
+    return host
 
 
 def host_allowed(host: str) -> bool:
@@ -175,7 +167,6 @@ def is_public_ip(ip_str: str) -> bool:
 
 
 def resolve_public_ips(host: str):
-    """Return the list of resolved IPs if ALL are public, else None."""
     try:
         infos = socket.getaddrinfo(host, None)
     except Exception:
@@ -192,9 +183,6 @@ def resolve_public_ips(host: str):
 
 
 def fetch_pinned(url: str, pinned_ip: str, timeout):
-    """Issue the request while forcing DNS resolution to the single IP we
-       already validated, closing the TOCTOU window between our check and
-       the actual connection (DNS-rebinding defense)."""
     original_getaddrinfo = socket.getaddrinfo
 
     def _pinned(host, port, *args, **kwargs):
@@ -215,8 +203,11 @@ def handle_fetch_url(args):
 
     current_url = url
     for _ in range(MAX_REDIRECTS + 1):
-        host = hostname_of(current_url)
-        if not host or not host_allowed(host):
+        host = parse_https_host(current_url)
+        if not host:
+            return {"action": "block",
+                    "reason": "Only public HTTPS URLs to allowed hosts are accepted (no userinfo, no non-standard port)."}
+        if not host_allowed(host):
             return {"action": "block",
                     "reason": f"Host '{host}' is not on the allowed list (example.com, www.iana.org)."}
 
@@ -233,7 +224,12 @@ def handle_fetch_url(args):
             return {"action": "block", "reason": f"Fetch failed: {e}"}
 
         if resp.status_code in (301, 302, 303, 307, 308) and "Location" in resp.headers:
-            current_url = urljoin(current_url, resp.headers["Location"])
+            next_url = urljoin(current_url, resp.headers["Location"])
+            # Re-validate scheme/host/port on the redirect target before following.
+            if not parse_https_host(next_url):
+                return {"action": "block",
+                        "reason": "Redirect target is not a valid public HTTPS URL."}
+            current_url = next_url
             continue
 
         body = resp.text[:200_000]
